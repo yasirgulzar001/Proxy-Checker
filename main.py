@@ -63,48 +63,95 @@ if not BOT_TOKEN:
 
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 
-# Hardcoded proxy source URLs (40)
+# Hardcoded proxy source URLs (56 sources)
 PROXY_SOURCES = [
+    # TheSpeedX lists
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    
+    # monosans proxy list
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    
+    # clarketm proxy list
     "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    
+    # r00tee Proxy List
     "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
     "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks4.txt",
     "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+    
+    # ALIILAPRO Proxy
     "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
     "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
     "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+    
+    # hookzof socks5 list
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    
+    # vakhov fresh proxy list
     "https://vakhov.github.io/fresh-proxy-list/http.txt",
     "https://vakhov.github.io/fresh-proxy-list/https.txt",
     "https://vakhov.github.io/fresh-proxy-list/socks4.txt",
     "https://vakhov.github.io/fresh-proxy-list/socks5.txt",
     "https://vakhov.github.io/fresh-proxy-list/proxylist.txt",
+    
+    # openproxylist
     "https://api.openproxylist.xyz/http.txt",
     "https://api.openproxylist.xyz/socks4.txt",
     "https://api.openproxylist.xyz/socks5.txt",
     "https://openproxylist.xyz/http.txt",
     "https://openproxylist.xyz/socks4.txt",
     "https://openproxylist.xyz/socks5.txt",
+    
+    # proxyspace
     "https://proxyspace.pro/http.txt",
     "https://proxyspace.pro/https.txt",
     "https://proxyspace.pro/socks4.txt",
     "https://proxyspace.pro/socks5.txt",
+    
+    # multiproxy
     "https://multiproxy.org/txt_all/proxy.txt",
+    
+    # worm
     "http://worm.rip/http.txt",
     "http://worm.rip/socks5.txt",
+    
+    # ErcinDedeoglu proxies
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+    
+    # proxifly free proxy list
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+    
+    # NEW SOURCES
+    
+    # 0x1881 Free Proxy List
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/http.txt",
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/https.txt",
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/socks4.txt",
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/socks5.txt",
+    
+    # gfpcom free proxy list
+    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list.txt",
+    
+    # ProxyScraper lists
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks4.txt",
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks5.txt",
+    
+    # officialputuids Proxy List
+    "https://raw.githubusercontent.com/officialputuids/Proxy-List/main/http.txt",
+    "https://raw.githubusercontent.com/officialputuids/Proxy-List/main/socks4.txt",
+    "https://raw.githubusercontent.com/officialputuids/Proxy-List/main/socks5.txt",
 ]
 
 # Judge URL for anonymity testing
@@ -761,11 +808,11 @@ async def cmd_help(message: types.Message):
 # ----------------------------------------------------------------------------
 @router.message(Command("scrape"))
 async def cmd_scrape(message: types.Message):
-    if not scraper:                     # Fixed: was "scaper"
+    if not scraper:
         await message.answer("Scraper not initialized.")
         return
     msg = await message.answer("🔄 Scraping started...")
-    count = await scraper.scrape_all()  # Fixed: was "scaper"
+    count = await scraper.scrape_all()
     await msg.edit_text(f"✅ Scraping completed. Added/updated {count} unique proxies.")
 
 @router.message(Command("listsources"))
@@ -785,7 +832,6 @@ async def process_addsource(message: types.Message, state: FSMContext):
         await message.answer("Invalid URL. Must start with http:// or https://")
         return
     PROXY_SOURCES.append(url)
-    # No need to update scraper.sources because it references the same global list
     await message.answer(f"✅ Added source: {url}")
     await state.clear()
 
@@ -864,7 +910,6 @@ async def cmd_check(message: types.Message, command: CommandObject):
 
     proxies_data = await db.get_proxies(status="unknown", protocol=protocol, country=country, anonymity=anonymity, limit=limit)
     if not proxies_data:
-        # If no unknown, check all alive as fallback?
         await message.answer("No proxies found matching criteria.")
         return
     proxies = [(p[0], p[1]) for p in proxies_data]
@@ -965,7 +1010,7 @@ async def cmd_filter(message: types.Message, command: CommandObject):
     text = "**Alive Proxies:**\n"
     for p in proxies:
         text += f"{p[0]} | {p[1]} | {p[2]} | {p[3]} | {p[4]}ms\n"
-    await message.answer(text[:4000])  # Telegram limit
+    await message.answer(text[:4000])
 
 @router.message(Command("top"))
 async def cmd_top(message: types.Message, command: CommandObject):
@@ -1078,8 +1123,8 @@ async def cmd_reset(message: types.Message):
 async def auto_scrape_loop():
     while True:
         try:
-            if scraper:                     # Fixed: was "scaper"
-                await scraper.scrape_all()  # Fixed: was "scaper"
+            if scraper:
+                await scraper.scrape_all()
         except Exception as e:
             logger.error(f"Auto scrape error: {e}")
         await asyncio.sleep(AUTO_SCRAPE_INTERVAL)
@@ -1087,7 +1132,6 @@ async def auto_scrape_loop():
 async def auto_check_loop():
     while True:
         try:
-            # Capped batch instead of loading the whole table into RAM every cycle
             proxies = await db.get_all_proxies_for_check(limit=AUTO_CHECK_BATCH_SIZE)
             if proxies:
                 semaphore = Semaphore(current_concurrency)
@@ -1099,9 +1143,7 @@ async def auto_check_loop():
 
 async def geoip_resolver_loop():
     """Background task: periodically batch-resolves country codes for alive
-    proxies that don't have one yet, via ip-api's /batch endpoint. Keeps
-    GeoIP lookups off the hot path of check_proxy entirely, so bulk checks
-    never stall or 429 waiting on the free-tier rate limit."""
+    proxies that don't have one yet, via ip-api's /batch endpoint."""
     while True:
         try:
             proxies = await db.get_proxies_missing_country(limit=GEOIP_BATCH_SIZE * 5)
@@ -1149,7 +1191,7 @@ async def cmd_auto_check(message: types.Message, command: CommandObject):
             await message.answer("Invalid minutes.")
             return
     else:
-        AUTO_CHECK_INTERVAL = 60  # default 1 min
+        AUTO_CHECK_INTERVAL = 60
     if "check" in auto_tasks:
         auto_tasks["check"].cancel()
     task = asyncio.create_task(auto_check_loop())
