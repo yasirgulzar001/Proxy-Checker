@@ -1255,6 +1255,9 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
+    # IMPORTANT: Delete any active webhook to allow polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
     await on_startup()
     try:
         await dp.start_polling(bot)
