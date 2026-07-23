@@ -23,7 +23,7 @@ import time
 from asyncio import Queue, Semaphore, wait_for
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 # Force uvloop if available
@@ -226,7 +226,7 @@ class Database:
                 last_checked = excluded.last_checked,
                 status = excluded.status,
                 source_url = COALESCE(excluded.source_url, source_url)
-        """, proxy, protocol, country, anonymity, speed, datetime.utcnow(), status, source_url)
+        """, proxy, protocol, country, anonymity, speed, datetime.now(timezone.utc), status, source_url)
 
     async def batch_upsert(self, records: List[Tuple]):
         """Batch upsert using executemany. Mirrors upsert_proxy's COALESCE merge
@@ -298,7 +298,7 @@ class Database:
         await self.execute("DELETE FROM proxies WHERE status = 'dead'")
 
     async def clear_old(self, days: int):
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         await self.execute("DELETE FROM proxies WHERE last_checked < ?", cutoff)
 
     async def get_all_proxies_for_check(self, limit: Optional[int] = None) -> List[Tuple[str, Optional[str]]]:
@@ -333,32 +333,36 @@ batch_writer_task: Optional[asyncio.Task] = None
 # Batch Writer Consumer
 # ============================================================================
 async def batch_writer():
-    """Consumes proxy check results from queue and writes to DB in batches."""
+    """Consumes proxy check results from queue and writes to DB in batches.
+    Flushes remaining items on graceful shutdown."""
     batch = []
-    while True:
-        try:
-            # Wait for first item with timeout to allow flushing
-            item = await asyncio.wait_for(write_queue.get(), timeout=2.0)
-            batch.append(item)
-            # Drain more items if available
-            while len(batch) < BATCH_SIZE:
-                try:
-                    item = write_queue.get_nowait()
-                    batch.append(item)
-                except asyncio.QueueEmpty:
-                    break
-            if batch:
-                await db.batch_upsert(batch)
-                logger.debug(f"Batch written {len(batch)} proxies")
-                batch.clear()
-        except asyncio.TimeoutError:
-            if batch:
-                await db.batch_upsert(batch)
-                logger.debug(f"Flushed {len(batch)} proxies on timeout")
-                batch.clear()
-        except Exception as e:
-            logger.error(f"Batch writer error: {e}")
-            await asyncio.sleep(1)
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(write_queue.get(), timeout=2.0)
+                batch.append(item)
+                # Drain more items if available
+                while len(batch) < BATCH_SIZE:
+                    try:
+                        item = write_queue.get_nowait()
+                        batch.append(item)
+                    except asyncio.QueueEmpty:
+                        break
+                if batch:
+                    await db.batch_upsert(batch)
+                    logger.debug(f"Batch written {len(batch)} proxies")
+                    batch.clear()
+            except asyncio.TimeoutError:
+                if batch:
+                    await db.batch_upsert(batch)
+                    logger.debug(f"Flushed {len(batch)} proxies on timeout")
+                    batch.clear()
+    except asyncio.CancelledError:
+        # Flush before shutdown
+        if batch:
+            await db.batch_upsert(batch)
+            logger.debug(f"Flushed {len(batch)} proxies on shutdown")
+        raise
 
 
 # ============================================================================
@@ -367,7 +371,6 @@ async def batch_writer():
 class ProxyChecker:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self.resolver: Optional[aiodns.DNSResolver] = None
         self.geoip_cache: Dict[str, str] = {}
         self.geoip_semaphore = Semaphore(50)  # limit concurrent GeoIP lookups
         self._tcp_semaphore = Semaphore(2000)  # limit concurrent TCP pre-checks
@@ -387,7 +390,6 @@ class ProxyChecker:
             timeout=timeout,
             json_serialize=lambda obj: orjson.dumps(obj).decode(),
         )
-        self.resolver = aiodns.DNSResolver()
 
     async def close(self):
         if self.session:
@@ -437,8 +439,6 @@ class ProxyChecker:
                 if "proxy-connection" not in headers_lower and anonymity == "anonymous":
                     anonymity = "elite"
 
-                # Country is resolved later in bulk by the background GeoIP
-                # resolver, not per-check — see resolve_geoip_batch().
                 return {
                     "proxy": proxy,
                     "protocol": proxy_type,
@@ -574,7 +574,7 @@ class ProxyChecker:
             # Single shared TCP reachability pre-check, done once instead of
             # once per protocol probe (was up to 4x per proxy).
             if not await self.quick_tcp_test(ip, port):
-                record = (proxy, None, None, None, None, datetime.utcnow(), "dead", None)
+                record = (proxy, None, None, None, None, datetime.now(timezone.utc), "dead", None)
                 await write_queue.put(record)
                 return None
 
@@ -611,14 +611,14 @@ class ProxyChecker:
                     best_result["country"],
                     best_result["anonymity"],
                     best_result["speed"],
-                    datetime.utcnow(),
+                    datetime.now(timezone.utc),
                     "alive",
                     None,  # source_url not updated during check
                 )
                 await write_queue.put(record)
                 return best_result
             else:
-                record = (proxy, None, None, None, None, datetime.utcnow(), "dead", None)
+                record = (proxy, None, None, None, None, datetime.now(timezone.utc), "dead", None)
                 await write_queue.put(record)
                 return None
 
@@ -644,7 +644,8 @@ def infer_protocol_hint(url: str) -> Optional[str]:
 class ProxyScraper:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
-        self.sources = PROXY_SOURCES.copy()
+        # Use a reference to the global list so that runtime additions/removals are seen immediately
+        self.sources = PROXY_SOURCES
 
     async def fetch_url(self, url: str) -> Optional[str]:
         try:
@@ -678,7 +679,7 @@ class ProxyScraper:
                     proxy_hints[proxy] = hint
 
         records = [
-            (proxy, hint, None, None, None, datetime.utcnow(), "unknown", "scraper")
+            (proxy, hint, None, None, None, datetime.now(timezone.utc), "unknown", "scraper")
             for proxy, hint in proxy_hints.items()
         ]
         await db.batch_upsert(records)
@@ -760,11 +761,11 @@ async def cmd_help(message: types.Message):
 # ----------------------------------------------------------------------------
 @router.message(Command("scrape"))
 async def cmd_scrape(message: types.Message):
-    if not scaper:
+    if not scraper:                     # Fixed: was "scaper"
         await message.answer("Scraper not initialized.")
         return
     msg = await message.answer("🔄 Scraping started...")
-    count = await scaper.scrape_all()
+    count = await scraper.scrape_all()  # Fixed: was "scaper"
     await msg.edit_text(f"✅ Scraping completed. Added/updated {count} unique proxies.")
 
 @router.message(Command("listsources"))
@@ -784,6 +785,7 @@ async def process_addsource(message: types.Message, state: FSMContext):
         await message.answer("Invalid URL. Must start with http:// or https://")
         return
     PROXY_SOURCES.append(url)
+    # No need to update scraper.sources because it references the same global list
     await message.answer(f"✅ Added source: {url}")
     await state.clear()
 
@@ -1076,8 +1078,8 @@ async def cmd_reset(message: types.Message):
 async def auto_scrape_loop():
     while True:
         try:
-            if scaper:
-                await scaper.scrape_all()
+            if scraper:                     # Fixed: was "scaper"
+                await scraper.scrape_all()  # Fixed: was "scaper"
         except Exception as e:
             logger.error(f"Auto scrape error: {e}")
         await asyncio.sleep(AUTO_SCRAPE_INTERVAL)
@@ -1220,18 +1222,24 @@ async def cmd_judge(message: types.Message):
 # Main
 # ============================================================================
 async def on_startup():
-    global checker, scaper, batch_writer_task, geoip_task
+    global checker, scraper, batch_writer_task, geoip_task
     await db.connect()
     checker = ProxyChecker()
     await checker.start()
-    scaper = ProxyScraper(checker.session)
+    scraper = ProxyScraper(checker.session)
     batch_writer_task = asyncio.create_task(batch_writer())
     geoip_task = asyncio.create_task(geoip_resolver_loop())
     logger.info("Bot started, components initialized.")
 
 async def on_shutdown():
+    # Gracefully shut down batch writer to flush remaining records
     if batch_writer_task:
         batch_writer_task.cancel()
+        try:
+            await batch_writer_task
+        except asyncio.CancelledError:
+            pass
+
     if geoip_task:
         geoip_task.cancel()
     for task in auto_tasks.values():
@@ -1254,4 +1262,4 @@ async def main():
         await on_shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())xies are generally anon
+    asyncio.run(main())
