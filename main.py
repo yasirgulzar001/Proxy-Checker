@@ -25,8 +25,8 @@ from aiogram.client.default import DefaultBotProperties
 # ==========================================
 # 1. CONFIG & CONSTANTS
 # ==========================================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-ADMIN_IDS = [123456789]  # Replace with your Telegram User ID
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"
+ADMIN_IDS = [6535041385]  # Replace with your Telegram User ID
 
 DEFAULT_PAGES = 10
 DEFAULT_RPS = 1.5
