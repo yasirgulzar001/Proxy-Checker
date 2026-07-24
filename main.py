@@ -1,608 +1,1310 @@
-import os
-import re
-import time
-import json
-import random
-import base64
+#!/usr/bin/env python3
+"""
+Ultra-Fast Asynchronous Proxy Checker & Scraper Telegram Bot
+Python 3.11+ required.
+"""
+#uvloop>=0.19.0
+#orjson>=3.9.0
+#aiohttp[speedups]>=3.9.0
+#aiohttp_socks>=0.8.0
+#aiogram>=3.0.0
+#aiosqlite>=0.19.0
+#python-socks[asyncio]>=2.0.0
+#aiodns>=3.0.0
+#aiofiles>=23.2.0
+#python-dotenv>=1.0.0
+
 import asyncio
 import logging
-import hashlib
-import aiofiles
-import aiosqlite
-from enum import Enum
+import os
+import re
+import socket
+import time
+from asyncio import Queue, Semaphore, wait_for
+from collections import defaultdict
 from dataclasses import dataclass, field
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote, quote_plus
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set, Tuple
 
-from selectolax.parser import HTMLParser
-from curl_cffi.requests import AsyncSession
+# Force uvloop if available
+try:
+    import uvloop
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, BufferedInputFile
-from aiogram.filters import Command
-from aiogram.enums import ParseMode
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
+import aiodns
+import aiofiles
+import aiohttp
+import aiosqlite
+import orjson
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import ClientTimeout, TCPConnector
+from aiohttp_socks import ProxyConnector
+from dotenv import load_dotenv
 
-# ==========================================
-# 1. CONFIG & CONSTANTS
-# ==========================================
-BOT_TOKEN = "8710434434:AAHR3EcMzwmGh9dBuj8cO0NXDlPvG_05I8Y"
-ADMIN_IDS = [6535041385]  # Replace with your Telegram User ID
+load_dotenv()
 
-DEFAULT_PAGES = 10
-DEFAULT_RPS = 1.5
-MAX_INFLIGHT_PER_PROXY = 5
-MAX_QUEUE_SIZE = 100_000
-WRITER_BATCH_SIZE = 500
-WRITER_FLUSH_INTERVAL = 0.5
+# ============================================================================
+# Configuration
+# ============================================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable not set")
 
-YAHOO_REGIONS = [
-    "https://search.yahoo.com",
-    "https://uk.search.yahoo.com",
-    "https://sg.search.yahoo.com",
-    "https://de.search.yahoo.com",
-    "https://fr.search.yahoo.com"
-]
-YAHOO_FR_PARAMS = ["yfp-t", "sfp", "2", "ush-news"]
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 
-# Domain Blacklist to filter out search engines and professional sites
-BLACKLISTED_DOMAINS = {
-    "yahoo.com", "r.search.yahoo.com", "search.yahoo.com", "login.yahoo.com",
-    "bing.com", "google.com", "duckduckgo.com", "baidu.com", "ask.com",
-    "aol.com", "yandex.com", "msn.com", "wikipedia.org", "youtube.com",
-    "facebook.com", "twitter.com", "x.com", "instagram.com", "linkedin.com",
-    "tiktok.com", "pinterest.com", "reddit.com", "amazon.com"
-}
-
-IDENTITY_BUNDLES = [
-    {
-        "tls": "chrome120",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "lang": "en-US,en;q=0.9",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
-    },
-    {
-        "tls": "safari17_0",
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "lang": "en-US,en;q=0.9",
-        "sec_ch_ua": None
-    },
-    {
-        "tls": "edge99",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.74 Safari/537.36 Edg/99.0.4844.74",
-        "lang": "en-US,en;q=0.9",
-        "sec_ch_ua": '"Not A;Brand";v="99", "Chromium";v="99", "Microsoft Edge";v="99"'
-    },
-    {
-        "tls": "firefox120",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "lang": "en-US,en;q=0.9",
-        "sec_ch_ua": None
-    }
-]
-
-@dataclass
-class Stats:
-    total_requests: int = 0
-    total_urls: int = 0
-    failed_requests: int = 0
-    start_time: float = 0.0
-
-# ==========================================
-# 2. PARSER & URL FILTERING
-# ==========================================
-def is_blacklisted(url: str) -> bool:
-    try:
-        netloc = urlparse(url).netloc.lower()
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-        for domain in BLACKLISTED_DOMAINS:
-            if netloc == domain or netloc.endswith("." + domain):
-                return True
-        return False
-    except Exception:
-        return True
-
-def decode_yahoo_url(raw_url: str) -> str:
-    if not raw_url:
-        return ""
+# Hardcoded proxy source URLs (56 sources)
+PROXY_SOURCES = [
+    # TheSpeedX lists
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
     
-    match = re.search(r'/RU=([^/]+)/R=', raw_url)
-    if match:
-        b64_str = match.group(1)
-        missing_padding = len(b64_str) % 4
-        if missing_padding:
-            b64_str += '=' * (4 - missing_padding)
-        try:
-            decoded = base64.urlsafe_b64decode(b64_str).decode('utf-8')
-            if decoded.startswith('http'):
-                return decoded
-        except Exception:
-            pass
-
-    match = re.search(r'RU=([^&]+)', raw_url)
-    if match:
-        decoded = unquote(match.group(1))
-        if decoded.startswith('http'):
-            return decoded
-
-    if raw_url.startswith('http') and 'yahoo.com' not in raw_url:
-        return raw_url
-
-    return ""
-
-def parse_yahoo_html(html_text: str):
-    tree = HTMLParser(html_text)
-    selectors = ['div#web ol li a.ac-1th', 'a.title', 'div.compTitle h3 a', 'a[data-boost]']
+    # monosans proxy list
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
     
-    found_urls = set()
-    for selector in selectors:
-        nodes = tree.css(selector)
-        for node in nodes:
-            href = node.attributes.get('href', '')
-            if not href:
-                continue
-            
-            url = decode_yahoo_url(href)
-            if url and url not in found_urls:
-                if is_blacklisted(url):
-                    continue
-                if url.startswith('javascript:') or url.startswith('mailto:'):
-                    continue
-                found_urls.add(url)
-                yield url
+    # clarketm proxy list
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    
+    # r00tee Proxy List
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks4.txt",
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+    
+    # ALIILAPRO Proxy
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+    
+    # hookzof socks5 list
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    
+    # vakhov fresh proxy list
+    "https://vakhov.github.io/fresh-proxy-list/http.txt",
+    "https://vakhov.github.io/fresh-proxy-list/https.txt",
+    "https://vakhov.github.io/fresh-proxy-list/socks4.txt",
+    "https://vakhov.github.io/fresh-proxy-list/socks5.txt",
+    "https://vakhov.github.io/fresh-proxy-list/proxylist.txt",
+    
+    # openproxylist
+    "https://api.openproxylist.xyz/http.txt",
+    "https://api.openproxylist.xyz/socks4.txt",
+    "https://api.openproxylist.xyz/socks5.txt",
+    "https://openproxylist.xyz/http.txt",
+    "https://openproxylist.xyz/socks4.txt",
+    "https://openproxylist.xyz/socks5.txt",
+    
+    # proxyspace
+    "https://proxyspace.pro/http.txt",
+    "https://proxyspace.pro/https.txt",
+    "https://proxyspace.pro/socks4.txt",
+    "https://proxyspace.pro/socks5.txt",
+    
+    # multiproxy
+    "https://multiproxy.org/txt_all/proxy.txt",
+    
+    # worm
+    "http://worm.rip/http.txt",
+    "http://worm.rip/socks5.txt",
+    
+    # ErcinDedeoglu proxies
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+    
+    # proxifly free proxy list
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+    
+    # NEW SOURCES
+    
+    # 0x1881 Free Proxy List
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/http.txt",
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/https.txt",
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/socks4.txt",
+    "https://raw.githubusercontent.com/0x1881/Free-Proxy-List/main/socks5.txt",
+    
+    # gfpcom free proxy list
+    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list.txt",
+    
+    # ProxyScraper lists
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks4.txt",
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks5.txt",
+    
+    # officialputuids Proxy List
+    "https://raw.githubusercontent.com/officialputuids/Proxy-List/main/http.txt",
+    "https://raw.githubusercontent.com/officialputuids/Proxy-List/main/socks4.txt",
+    "https://raw.githubusercontent.com/officialputuids/Proxy-List/main/socks5.txt",
+]
 
-# ==========================================
-# 3. STORAGE & DEDUP
-# ==========================================
-class DedupManager:
-    def __init__(self):
-        self.seen = set()
+# Judge URL for anonymity testing
+DEFAULT_JUDGE_URL = "http://httpbin.org/headers"
+TEST_URL = DEFAULT_JUDGE_URL  # can be changed via /seturl
 
-    def normalize_url(self, url: str) -> str:
-        try:
-            parsed = urlparse(url)
-            scheme = parsed.scheme.lower()
-            netloc = parsed.netloc.lower()
-            path = parsed.path.rstrip('/')
-            query = parse_qs(parsed.query)
-            clean_query = {k: v for k, v in query.items() if not k.startswith(('utm_', 'ref', 'fr'))}
-            query_str = urlencode(clean_query, doseq=True)
-            return urlunparse((scheme, netloc, path, '', query_str, ''))
-        except Exception:
-            return url
+# Concurrency settings
+DEFAULT_CONCURRENCY = 1000
+MAX_CONCURRENCY = 5000
+current_concurrency = DEFAULT_CONCURRENCY
 
-    def is_duplicate(self, url: str) -> bool:
-        norm = self.normalize_url(url)
-        url_hash = hashlib.sha256(norm.encode()).hexdigest()
-        if url_hash in self.seen:
-            return True
-        self.seen.add(url_hash)
-        return False
+# Auto tasks intervals (in seconds)
+AUTO_SCRAPE_INTERVAL = 6 * 3600  # 6 hours
+AUTO_CHECK_INTERVAL = None  # disabled by default
 
+# Database path
+DB_PATH = "proxies.db"
+
+# Batch write size
+BATCH_SIZE = 500
+
+# GeoIP resolution (decoupled from live checks to avoid rate-limit stalls)
+IPAPI_KEY = os.getenv("IPAPI_KEY", "")
+IPAPI_BATCH_URL = f"https://pro.ip-api.com/batch?key={IPAPI_KEY}" if IPAPI_KEY else "http://ip-api.com/batch"
+GEOIP_BATCH_SIZE = 100
+GEOIP_RESOLVE_INTERVAL = 30  # seconds between background resolver cycles
+
+# Auto-check RAM cap: proxies pulled into memory per auto_check cycle
+AUTO_CHECK_BATCH_SIZE = 5000
+
+PRIVATE_IP_PREFIXES = (
+    "127.", "192.168.", "10.",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+)
+
+# ============================================================================
+# Logging
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Database Layer (aiosqlite)
+# ============================================================================
 class Database:
-    def __init__(self, db_path: str = "yahoo_dorker.db"):
+    def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
-        self.queue = asyncio.Queue(maxsize=100_000)
-        self.dedup = DedupManager()
-        self.writer_task = None
-        self.db = None
+        self._conn: Optional[aiosqlite.Connection] = None
 
-    async def init(self):
-        self.db = await aiosqlite.connect(self.db_path)
-        self.db.row_factory = aiosqlite.Row
-        await self.db.execute("PRAGMA journal_mode=WAL;")
-        await self.db.execute("PRAGMA synchronous=NORMAL;")
-        await self.db.execute("PRAGMA temp_store=MEMORY;")
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS urls (
-                hash TEXT PRIMARY KEY,
-                url TEXT,
-                dork TEXT,
-                ts INTEGER
+    async def connect(self):
+        self._conn = await aiosqlite.connect(self.db_path)
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS proxies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proxy TEXT UNIQUE NOT NULL,
+                protocol TEXT,
+                country TEXT,
+                anonymity TEXT,
+                speed INTEGER,
+                last_checked TIMESTAMP,
+                status TEXT DEFAULT 'dead',
+                source_url TEXT
             )
         """)
-        await self.db.commit()
-        self.writer_task = asyncio.create_task(self._writer_loop())
+        await self._conn.commit()
+        # Create index for faster queries
+        await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON proxies(status)")
+        await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_protocol ON proxies(protocol)")
+        await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_speed ON proxies(speed)")
+        await self._conn.commit()
 
-    async def _writer_loop(self):
-        batch = []
+    async def close(self):
+        if self._conn:
+            await self._conn.close()
+
+    async def execute(self, query: str, *args):
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, args)
+            await self._conn.commit()
+
+    async def executemany(self, query: str, args_list: List[Tuple]):
+        async with self._conn.cursor() as cur:
+            await cur.executemany(query, args_list)
+            await self._conn.commit()
+
+    async def fetchone(self, query: str, *args):
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, args)
+            return await cur.fetchone()
+
+    async def fetchall(self, query: str, *args):
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, args)
+            return await cur.fetchall()
+
+    # ------------------------------------------------------------------------
+    # Proxy management
+    # ------------------------------------------------------------------------
+    async def upsert_proxy(self, proxy: str, protocol: Optional[str] = None,
+                           country: Optional[str] = None, anonymity: Optional[str] = None,
+                           speed: Optional[int] = None, status: str = "unknown",
+                           source_url: Optional[str] = None):
+        """Insert or update proxy record."""
+        await self.execute("""
+            INSERT INTO proxies (proxy, protocol, country, anonymity, speed, last_checked, status, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(proxy) DO UPDATE SET
+                protocol = COALESCE(excluded.protocol, protocol),
+                country = COALESCE(excluded.country, country),
+                anonymity = COALESCE(excluded.anonymity, anonymity),
+                speed = COALESCE(excluded.speed, speed),
+                last_checked = excluded.last_checked,
+                status = excluded.status,
+                source_url = COALESCE(excluded.source_url, source_url)
+        """, proxy, protocol, country, anonymity, speed, datetime.now(timezone.utc), status, source_url)
+
+    async def batch_upsert(self, records: List[Tuple]):
+        """Batch upsert using executemany. Mirrors upsert_proxy's COALESCE merge
+        so a re-scrape (which passes protocol=None, country=None, etc.) no longer
+        wipes out previously-verified data for a proxy that's already in the DB."""
+        query = """
+            INSERT INTO proxies (proxy, protocol, country, anonymity, speed, last_checked, status, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(proxy) DO UPDATE SET
+                protocol = COALESCE(excluded.protocol, protocol),
+                country = COALESCE(excluded.country, country),
+                anonymity = COALESCE(excluded.anonymity, anonymity),
+                speed = COALESCE(excluded.speed, speed),
+                last_checked = excluded.last_checked,
+                status = excluded.status,
+                source_url = COALESCE(excluded.source_url, source_url)
+        """
+        await self.executemany(query, records)
+
+    async def batch_update_country(self, records: List[Tuple[str, str]]):
+        """Targeted country-only update (used by the async GeoIP resolver so it
+        never clobbers a status that may have changed since the record was queued)."""
+        query = "UPDATE proxies SET country = ? WHERE proxy = ?"
+        await self.executemany(query, records)
+
+    async def get_proxies(self, status: str = "alive", protocol: Optional[str] = None,
+                          country: Optional[str] = None, anonymity: Optional[str] = None,
+                          limit: Optional[int] = None) -> List[Tuple]:
+        query = "SELECT proxy, protocol, country, anonymity, speed, last_checked FROM proxies WHERE status = ?"
+        params = [status]
+        if protocol:
+            query += " AND protocol = ?"
+            params.append(protocol)
+        if country:
+            query += " AND country = ?"
+            params.append(country)
+        if anonymity:
+            query += " AND anonymity = ?"
+            params.append(anonymity)
+        query += " ORDER BY speed ASC"
+        if limit:
+            query += f" LIMIT {limit}"
+        return await self.fetchall(query, *params)
+
+    async def get_stats(self) -> Dict:
+        total_row = await self.fetchone("SELECT COUNT(*) FROM proxies")
+        alive_row = await self.fetchone("SELECT COUNT(*) FROM proxies WHERE status = 'alive'")
+        total = total_row[0]
+        alive = alive_row[0]
+        # breakdown by protocol
+        proto_counts = await self.fetchall(
+            "SELECT protocol, COUNT(*) FROM proxies WHERE status = 'alive' GROUP BY protocol"
+        )
+        country_counts = await self.fetchall(
+            "SELECT country, COUNT(*) FROM proxies WHERE status = 'alive' AND country IS NOT NULL GROUP BY country ORDER BY COUNT(*) DESC LIMIT 10"
+        )
+        anonymity_counts = await self.fetchall(
+            "SELECT anonymity, COUNT(*) FROM proxies WHERE status = 'alive' AND anonymity IS NOT NULL GROUP BY anonymity"
+        )
+        return {
+            "total": total,
+            "alive": alive,
+            "by_protocol": dict(proto_counts),
+            "by_country": dict(country_counts),
+            "by_anonymity": dict(anonymity_counts),
+        }
+
+    async def clear_dead(self):
+        await self.execute("DELETE FROM proxies WHERE status = 'dead'")
+
+    async def clear_old(self, days: int):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        await self.execute("DELETE FROM proxies WHERE last_checked < ?", cutoff)
+
+    async def get_all_proxies_for_check(self, limit: Optional[int] = None) -> List[Tuple[str, Optional[str]]]:
+        """Return list of (proxy, protocol_hint) tuples to be checked.
+        limit caps how many rows get pulled into memory at once."""
+        query = "SELECT proxy, protocol FROM proxies ORDER BY last_checked ASC"
+        if limit:
+            query += f" LIMIT {limit}"
+        rows = await self.fetchall(query)
+        return [(row[0], row[1]) for row in rows]
+
+    async def get_proxies_missing_country(self, limit: int = 500) -> List[str]:
+        """Alive proxies with no resolved country yet, for the background GeoIP resolver."""
+        rows = await self.fetchall(
+            "SELECT proxy FROM proxies WHERE status = 'alive' AND (country IS NULL OR country = '') LIMIT ?",
+            limit,
+        )
+        return [row[0] for row in rows]
+
+    async def vacuum(self):
+        await self.execute("VACUUM")
+
+
+# ============================================================================
+# Global DB instance and queue for batch writes
+# ============================================================================
+db = Database()
+write_queue: Queue = Queue()
+batch_writer_task: Optional[asyncio.Task] = None
+
+# ============================================================================
+# Batch Writer Consumer
+# ============================================================================
+async def batch_writer():
+    """Consumes proxy check results from queue and writes to DB in batches.
+    Flushes remaining items on graceful shutdown."""
+    batch = []
+    try:
         while True:
             try:
-                item = await asyncio.wait_for(self.queue.get(), timeout=WRITER_FLUSH_INTERVAL)
+                item = await asyncio.wait_for(write_queue.get(), timeout=2.0)
                 batch.append(item)
-                while len(batch) < WRITER_BATCH_SIZE:
+                # Drain more items if available
+                while len(batch) < BATCH_SIZE:
                     try:
-                        item = self.queue.get_nowait()
+                        item = write_queue.get_nowait()
                         batch.append(item)
                     except asyncio.QueueEmpty:
                         break
+                if batch:
+                    await db.batch_upsert(batch)
+                    logger.debug(f"Batch written {len(batch)} proxies")
+                    batch.clear()
             except asyncio.TimeoutError:
-                pass
+                if batch:
+                    await db.batch_upsert(batch)
+                    logger.debug(f"Flushed {len(batch)} proxies on timeout")
+                    batch.clear()
+    except asyncio.CancelledError:
+        # Flush before shutdown
+        if batch:
+            await db.batch_upsert(batch)
+            logger.debug(f"Flushed {len(batch)} proxies on shutdown")
+        raise
 
-            if batch:
-                await self._insert_batch(batch)
-                batch.clear()
 
-    async def _insert_batch(self, batch):
-        sql = "INSERT OR IGNORE INTO urls (hash, url, dork, ts) VALUES (?, ?, ?, ?)"
-        await self.db.executemany(sql, batch)
-        await self.db.commit()
-
-    async def add_url(self, url: str, dork: str):
-        if self.dedup.is_duplicate(url):
-            return False
-        norm = self.dedup.normalize_url(url)
-        url_hash = hashlib.sha256(norm.encode()).hexdigest()
-        await self.queue.put((url_hash, url, dork, int(time.time())))
-        return True
-
-# ==========================================
-# 4. PROXY POOL
-# ==========================================
-class ProxyState(Enum):
-    CLOSED = 1
-    OPEN = 2
-    HALF_OPEN = 3
-
-@dataclass
-class Proxy:
-    proxy_str: str
-    identity: dict
-    state: ProxyState = ProxyState.CLOSED
-    failure_count: int = 0
-    last_failure_time: float = 0.0
-    cooldown: int = 60
-    inflight: int = 0
-    tokens: float = field(default_factory=lambda: DEFAULT_RPS)
-    last_token_update: float = field(default_factory=time.time)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    
-    async def acquire(self, current_rps: float):
-        async with self.lock:
-            now = time.time()
-            elapsed = now - self.last_token_update
-            self.tokens = min(current_rps, self.tokens + (elapsed * current_rps))
-            self.last_token_update = now
-            
-            if self.tokens < 1.0:
-                return False
-            
-            if self.state == ProxyState.OPEN:
-                if now - self.last_failure_time > self.cooldown:
-                    self.state = ProxyState.HALF_OPEN
-                else:
-                    return False
-            
-            if self.inflight >= MAX_INFLIGHT_PER_PROXY:
-                return False
-                
-            self.tokens -= 1.0
-            self.inflight += 1
-            return True
-
-    async def release(self, success: bool):
-        async with self.lock:
-            self.inflight -= 1
-            if success:
-                self.failure_count = 0
-                self.state = ProxyState.CLOSED
-                self.cooldown = 60
-            else:
-                self.failure_count += 1
-                self.last_failure_time = time.time()
-                if self.failure_count >= 3:
-                    self.state = ProxyState.OPEN
-                    self.cooldown = min(self.cooldown * 2, 600)
-
-class ProxyPool:
+# ============================================================================
+# Proxy Checker (Ultra-fast)
+# ============================================================================
+class ProxyChecker:
     def __init__(self):
-        self.proxies: list[Proxy] = []
-        
-    def load_proxies(self, proxy_lines: list[str]):
-        self.proxies.clear()
-        for line in proxy_lines:
-            line = line.strip()
-            if not line or ':' not in line:
-                continue
-            identity = random.choice(IDENTITY_BUNDLES)
-            self.proxies.append(Proxy(proxy_str=line, identity=identity))
-            
-    async def get_proxy(self, current_rps: float) -> Proxy | None:
-        available = []
-        for p in self.proxies:
-            if await p.acquire(current_rps):
-                available.append(p)
-        if not available:
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.geoip_cache: Dict[str, str] = {}
+        self.geoip_semaphore = Semaphore(50)  # limit concurrent GeoIP lookups
+        self._tcp_semaphore = Semaphore(2000)  # limit concurrent TCP pre-checks
+
+    async def start(self):
+        # Custom connector with aggressive settings
+        connector = TCPConnector(
+            limit=0,
+            ttl_dns_cache=300,
+            force_close=True,
+            enable_cleanup_closed=True,
+            use_dns_cache=True,
+        )
+        timeout = ClientTimeout(total=3, connect=1.5, sock_read=1.5)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            json_serialize=lambda obj: orjson.dumps(obj).decode(),
+        )
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def quick_tcp_test(self, ip: str, port: int) -> bool:
+        """Fast pre-check if host:port is reachable."""
+        try:
+            async with self._tcp_semaphore:
+                _, writer = await wait_for(
+                    asyncio.open_connection(ip, port),
+                    timeout=1.0
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+        except Exception:
+            return False
+
+    async def check_http(self, proxy: str, proxy_type: str = "http", skip_tcp_check: bool = False) -> Optional[Dict]:
+        """Test HTTP/HTTPS proxy."""
+        ip, port = proxy.split(":")
+        port = int(port)
+        # Quick TCP pre-check (skipped if check_proxy already did it for this proxy)
+        if not skip_tcp_check and not await self.quick_tcp_test(ip, port):
             return None
-        return min(available, key=lambda p: p.inflight)
 
-    async def check_proxies(self):
-        alive = sum(1 for p in self.proxies if p.state == ProxyState.CLOSED)
-        return {"alive": alive, "dead": len(self.proxies) - alive, "total": len(self.proxies)}
+        start = time.monotonic()
+        try:
+            proxy_url = f"{proxy_type}://{proxy}"
+            async with self.session.get(
+                TEST_URL,
+                proxy=proxy_url,
+                timeout=ClientTimeout(total=3),
+                headers={"User-Agent": "Mozilla/5.0"}
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                content = await resp.text()
+                speed = int((time.monotonic() - start) * 1000)
 
-# ==========================================
-# 5. DORK ENGINE
-# ==========================================
-class DorkEngine:
-    def __init__(self, db: Database):
-        self.db = db
-        self.pool = ProxyPool()
-        self.queue = asyncio.Queue(maxsize=100_000)
-        self.stop_event = asyncio.Event()
-        self.pause_event = asyncio.Event()
-        self.pause_event.set()
-        self.workers = []
-        self.stats = Stats()
-        self.current_speed = DEFAULT_RPS
-        
-    async def load_dorks(self, dorks: list[str], pages: int):
-        for dork in dorks:
-            dork = dork.strip()
-            if not dork:
-                continue
-            for page in range(1, pages + 1):
-                await self.queue.put((dork, page))
-                
-    async def start(self, num_workers: int = 50):
-        self.stop_event.clear()
-        self.pause_event.set()
-        self.stats.start_time = time.time()
-        
-        if not self.workers:
-            for i in range(num_workers):
-                self.workers.append(asyncio.create_task(self._worker(i)))
-                
-    async def stop(self):
-        self.stop_event.set()
-        for w in self.workers:
-            w.cancel()
-        self.workers.clear()
-        
-    def pause(self):
-        self.pause_event.clear()
-        
-    def resume(self):
-        self.pause_event.set()
-        
-    def set_speed(self, rps: float):
-        self.current_speed = rps
-            
-    async def _worker(self, worker_id: int):
-        async with AsyncSession() as session:
-            while not self.stop_event.is_set():
-                await self.pause_event.wait()
-                
-                try:
-                    dork, page = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-                    
-                proxy = await self.pool.get_proxy(self.current_speed)
-                if not proxy:
-                    await self.queue.put((dork, page))
-                    await asyncio.sleep(1.0)
-                    continue
-                    
-                success = False
-                try:
-                    url = self._build_yahoo_url(dork, page)
-                    headers = {
-                        "User-Agent": proxy.identity["ua"],
-                        "Accept-Language": proxy.identity["lang"],
-                        "Referer": random.choice(["https://www.google.com/", "https://www.bing.com/", "https://duckduckgo.com/"])
+                # Detect anonymity
+                anonymity = "transparent"
+                headers_lower = content.lower()
+                if "x-forwarded-for" not in headers_lower and "via" not in headers_lower:
+                    anonymity = "anonymous"
+                if "proxy-connection" not in headers_lower and anonymity == "anonymous":
+                    anonymity = "elite"
+
+                return {
+                    "proxy": proxy,
+                    "protocol": proxy_type,
+                    "country": None,
+                    "anonymity": anonymity,
+                    "speed": speed,
+                    "status": "alive",
+                }
+        except Exception:
+            return None
+
+    async def check_socks(self, proxy: str, socks_ver: int, skip_tcp_check: bool = False) -> Optional[Dict]:
+        """Test SOCKS4/SOCKS5 proxy."""
+        ip, port = proxy.split(":")
+        port = int(port)
+        if not skip_tcp_check and not await self.quick_tcp_test(ip, port):
+            return None
+
+        start = time.monotonic()
+        try:
+            connector = ProxyConnector.from_url(f"socks{socks_ver}://{proxy}")
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=ClientTimeout(total=3),
+                cookie_jar=aiohttp.DummyCookieJar(),  # skip cookie-jar bookkeeping we never use
+            ) as sess:
+                async with sess.get(TEST_URL) as resp:
+                    if resp.status != 200:
+                        return None
+                    speed = int((time.monotonic() - start) * 1000)
+                    # SOCKS proxies are generally anonymous, but we can still classify
+                    anonymity = "elite" if socks_ver == 5 else "anonymous"
+                    return {
+                        "proxy": proxy,
+                        "protocol": f"socks{socks_ver}",
+                        "country": None,
+                        "anonymity": anonymity,
+                        "speed": speed,
+                        "status": "alive",
                     }
-                    if proxy.identity["sec_ch_ua"]:
-                        headers["Sec-CH-UA"] = proxy.identity["sec_ch_ua"]
-                        
-                    proxies = {"http": proxy.proxy_str, "https": proxy.proxy_str}
-                    
-                    r = await session.get(
-                        url, 
-                        headers=headers, 
-                        proxies=proxies, 
-                        impersonate=proxy.identity["tls"], 
-                        timeout=10
-                    )
-                    
-                    self.stats.total_requests += 1
-                    
-                    if r.status_code == 200:
-                        for extracted_url in parse_yahoo_html(r.text):
-                            if await self.db.add_url(extracted_url, dork):
-                                self.stats.total_urls += 1
-                        success = True
-                    elif r.status_code in (403, 429, 999):
-                        success = False
-                    else:
-                        success = True 
-                        
+        except Exception:
+            return None
+
+    async def get_country(self, ip: str) -> str:
+        """Get country code using ip-api.com (rate limited) or cache."""
+        if ip in self.geoip_cache:
+            return self.geoip_cache[ip]
+
+        # Skip private/local IPs
+        if ip.startswith(PRIVATE_IP_PREFIXES):
+            return "local"
+
+        async with self.geoip_semaphore:
+            try:
+                async with self.session.get(
+                    f"http://ip-api.com/json/{ip}?fields=countryCode",
+                    timeout=ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(loads=orjson.loads)
+                        country = data.get("countryCode", "unknown")
+                        self.geoip_cache[ip] = country
+                        return country
+            except Exception:
+                pass
+        return "unknown"
+
+    async def resolve_geoip_batch(self, ips: List[str]) -> Dict[str, str]:
+        """Resolve country codes for many IPs at once via ip-api's /batch endpoint
+        (up to 100 IPs per call), instead of one HTTP request per proxy. Paced to
+        stay under the free-tier rate limit; set IPAPI_KEY for a paid tier if
+        checking at very high volume."""
+        results: Dict[str, str] = {}
+        to_query: List[str] = []
+        for ip in ips:
+            if ip in self.geoip_cache:
+                results[ip] = self.geoip_cache[ip]
+            elif ip.startswith(PRIVATE_IP_PREFIXES):
+                results[ip] = "local"
+                self.geoip_cache[ip] = "local"
+            else:
+                to_query.append(ip)
+
+        for i in range(0, len(to_query), GEOIP_BATCH_SIZE):
+            chunk = to_query[i:i + GEOIP_BATCH_SIZE]
+            async with self.geoip_semaphore:
+                try:
+                    async with self.session.post(
+                        IPAPI_BATCH_URL,
+                        json=[{"query": ip, "fields": "query,countryCode"} for ip in chunk],
+                        timeout=ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(loads=orjson.loads)
+                            for entry in data:
+                                ip_r = entry.get("query")
+                                cc = entry.get("countryCode") or "unknown"
+                                if ip_r:
+                                    results[ip_r] = cc
+                                    self.geoip_cache[ip_r] = cc
+                        elif resp.status == 429:
+                            logger.warning("GeoIP batch endpoint rate-limited, backing off")
+                            await asyncio.sleep(5)
                 except Exception as e:
-                    success = False
-                finally:
-                    await proxy.release(success)
-                    self.queue.task_done()
-                    if not success:
-                        self.stats.failed_requests += 1
+                    logger.debug(f"GeoIP batch error: {e}")
+            if i + GEOIP_BATCH_SIZE < len(to_query):
+                await asyncio.sleep(1.5)  # pace successive batch calls
+        return results
 
-    def _build_yahoo_url(self, dork: str, page: int) -> str:
-        region = random.choice(YAHOO_REGIONS)
-        fr = random.choice(YAHOO_FR_PARAMS)
-        offset = (page - 1) * 10 + 1
-        return f"{region}/search?p={quote_plus(dork)}&pz=10&b={offset}&fr={fr}"
+    async def check_proxy(self, proxy: str, semaphore: Semaphore,
+                           protocol_hint: Optional[str] = None,
+                           resolve_geo: bool = False) -> Optional[Dict]:
+        """Check a single proxy.
 
-# ==========================================
-# 6. TELEGRAM BOT
-# ==========================================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+        protocol_hint (from the source URL, e.g. a socks5.txt list) lets us
+        probe only the relevant protocol(s) instead of blindly firing off
+        http+https+socks4+socks5 for every proxy. Falls back to probing
+        everything when the hint is unknown, so behavior is unchanged for
+        proxies with no metadata.
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+        resolve_geo does an inline single-IP GeoIP lookup for callers that
+        need an immediate answer (the /test command on a single proxy).
+        Bulk checks leave country unset and let the background
+        geoip_resolver_loop batch-resolve it instead.
+        """
+        async with semaphore:
+            try:
+                ip, port_str = proxy.split(":")
+                port = int(port_str)
+            except ValueError:
+                return None
+
+            # Single shared TCP reachability pre-check, done once instead of
+            # once per protocol probe (was up to 4x per proxy).
+            if not await self.quick_tcp_test(ip, port):
+                record = (proxy, None, None, None, None, datetime.now(timezone.utc), "dead", None)
+                await write_queue.put(record)
+                return None
+
+            if protocol_hint == "socks5":
+                probes = [self.check_socks(proxy, 5, skip_tcp_check=True)]
+            elif protocol_hint == "socks4":
+                probes = [self.check_socks(proxy, 4, skip_tcp_check=True)]
+            elif protocol_hint == "http":
+                probes = [
+                    self.check_http(proxy, "http", skip_tcp_check=True),
+                    self.check_http(proxy, "https", skip_tcp_check=True),
+                ]
+            else:
+                probes = [
+                    self.check_http(proxy, "http", skip_tcp_check=True),
+                    self.check_http(proxy, "https", skip_tcp_check=True),
+                    self.check_socks(proxy, 4, skip_tcp_check=True),
+                    self.check_socks(proxy, 5, skip_tcp_check=True),
+                ]
+            results = await asyncio.gather(*probes, return_exceptions=True)
+
+            best_result = None
+            for res in results:
+                if isinstance(res, dict) and res and res.get("status") == "alive":
+                    if best_result is None or res["speed"] < best_result["speed"]:
+                        best_result = res
+
+            if best_result:
+                if resolve_geo:
+                    best_result["country"] = await self.get_country(ip)
+                record = (
+                    best_result["proxy"],
+                    best_result["protocol"],
+                    best_result["country"],
+                    best_result["anonymity"],
+                    best_result["speed"],
+                    datetime.now(timezone.utc),
+                    "alive",
+                    None,  # source_url not updated during check
+                )
+                await write_queue.put(record)
+                return best_result
+            else:
+                record = (proxy, None, None, None, None, datetime.now(timezone.utc), "dead", None)
+                await write_queue.put(record)
+                return None
+
+
+# ============================================================================
+# Proxy Scraper
+# ============================================================================
+def infer_protocol_hint(url: str) -> Optional[str]:
+    """Guess a proxy's protocol from its source list URL (e.g. .../socks5.txt).
+    Used to skip redundant protocol probing during checks. Returns None if
+    the source doesn't indicate a protocol, in which case the checker falls
+    back to probing all protocols for that proxy."""
+    u = url.lower()
+    if "socks5" in u:
+        return "socks5"
+    if "socks4" in u:
+        return "socks4"
+    if "http" in u:  # covers http.txt and https.txt lists
+        return "http"
+    return None
+
+
+class ProxyScraper:
+    def __init__(self, session: aiohttp.ClientSession):
+        self.session = session
+        # Use a reference to the global list so that runtime additions/removals are seen immediately
+        self.sources = PROXY_SOURCES
+
+    async def fetch_url(self, url: str) -> Optional[str]:
+        try:
+            async with self.session.get(url, timeout=ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+        except Exception as e:
+            logger.warning(f"Failed to fetch {url}: {e}")
+        return None
+
+    def parse_proxies(self, text: str) -> Set[str]:
+        """Extract IP:PORT from text."""
+        pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b")
+        return set(pattern.findall(text))
+
+    async def scrape_all(self) -> int:
+        """Scrape all sources and return number of new proxies added."""
+        tasks = [self.fetch_url(url) for url in self.sources]
+        results = await asyncio.gather(*tasks)
+
+        # Track a protocol hint per proxy based on which source list(s) it
+        # came from (e.g. a proxy from socks5.txt gets hint "socks5"). This
+        # lets check_proxy skip redundant protocol probes later.
+        proxy_hints: Dict[str, Optional[str]] = {}
+        for url, text in zip(self.sources, results):
+            if not text:
+                continue
+            hint = infer_protocol_hint(url)
+            for proxy in self.parse_proxies(text):
+                if proxy not in proxy_hints or proxy_hints[proxy] is None:
+                    proxy_hints[proxy] = hint
+
+        records = [
+            (proxy, hint, None, None, None, datetime.now(timezone.utc), "unknown", "scraper")
+            for proxy, hint in proxy_hints.items()
+        ]
+        await db.batch_upsert(records)
+        logger.info(f"Scraped {len(proxy_hints)} unique proxies.")
+        return len(proxy_hints)
+
+
+# ============================================================================
+# Telegram Bot Handlers
+# ============================================================================
 router = Router()
-dp.include_router(router)
+checker: Optional[ProxyChecker] = None
+scraper: Optional[ProxyScraper] = None
+auto_tasks: Dict[str, asyncio.Task] = {}  # "scrape", "check"
+geoip_task: Optional[asyncio.Task] = None
 
-db = Database()
-engine = DorkEngine(db)
-user_sessions = {}
+# FSM for /addsource
+class SourceStates(StatesGroup):
+    waiting_for_url = State()
 
-def admin_only(func):
-    async def wrapper(message: Message):
-        if message.from_user.id not in ADMIN_IDS:
-            return await message.reply("⛔ Unauthorized.")
-        return await func(message)
-    return wrapper
 
-@router.message(Command("help"))
-@admin_only
-async def cmd_help(message: Message):
-    await message.reply(
-        "📖 <b>Yahoo Dorker Commands</b>\n"
-        "/pages <n> - Set pages per dork (1-50)\n"
-        "/setproxys - Upload .txt of proxies to load\n"
-        "/checkproxys - Check alive/dead proxies\n"
-        "/setspeed <rps> - Set per-proxy req/sec (default 1.5)\n"
-        "/status - Live stats (updates every 2s)\n"
-        "/pause - Pause engine\n"
-        "/resume - Resume engine\n"
-        "/stop - Stop engine and export results\n"
-        "/export - Export current results to file\n"
-        "/reset - Full reset queue & DB"
+@router.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "🚀 **Ultra-Fast Proxy Checker & Scraper Bot**\n\n"
+        "Use /help for available commands.\n"
+        f"Current concurrency: {current_concurrency}\n"
+        f"Test URL: {TEST_URL}"
     )
 
-@router.message(Command("pages"))
-@admin_only
-async def cmd_pages(message: Message):
-    try:
-        n = int(message.text.split()[1])
-        if 1 <= n <= 50:
-            user_sessions[message.from_user.id] = {"pages": n}
-            await message.reply(f"✅ Pages set to {n}. Send .txt file with dorks to begin.")
-        else:
-            await message.reply("❌ Pages must be 1-50.")
-    except:
-        await message.reply("Usage: /pages <n>")
+@router.message(Command("help"))
+async def cmd_help(message: types.Message):
+    help_text = """
+**Commands:**
 
-@router.message(Command("setproxys"))
-@admin_only
-async def cmd_setproxys(message: Message):
-    await message.reply("📤 Please send a .txt file with proxies (ip:port or user:pass@ip:port).")
+**Scraping:**
+/scrape - Start manual scrape
+/scrape_status - Show last scrape info
+/addsource <url> - Add custom source
+/removesource <url> - Remove source
+/listsources - List all sources
 
-@router.message(F.document)
-@admin_only
-async def handle_document(message: Message):
-    file_id = message.document.file_id
-    file = await bot.get_file(file_id)
-    
-    if not file.file_name.endswith('.txt'):
-        return await message.reply("❌ Only .txt files supported.")
-        
-    file_path = await bot.download_file(file.file_path)
-    content = file_path.read().decode('utf-8', errors='ignore').splitlines()
-    
-    if "proxy" in message.caption.lower() if message.caption else False:
-        engine.pool.load_proxies(content)
-        await message.reply(f"✅ Loaded {len(engine.pool.proxies)} proxies.")
+**Checking:**
+/check [amount] [protocol] [country] [anonymity] - Check proxies
+/checkall - Check all proxies in DB
+/test <proxy> - Test single proxy
+/seturl <url> - Change test URL
+/setthreads <number> - Set concurrency (max 5000)
+
+**Stats & Filtering:**
+/stats - Show statistics
+/filter <protocol> <country> <anonymity> - List alive proxies
+/top [amount] [protocol] [country] - Show fastest proxies
+/countries - List countries with counts
+
+**Export:**
+/export [txt|json|csv] [protocol] [country] [anonymity]
+
+**Maintenance:**
+/clear_dead - Delete dead proxies
+/clear_old [days] - Delete old records
+/backup - Create DB backup
+/reset - Reset database
+
+**Automation:**
+/auto_check [minutes] - Enable auto check
+/auto_scrape [hours] - Enable auto scrape
+/stop_auto - Stop all auto tasks
+/status - Show system status
+
+**Advanced:**
+/scan <url> [protocol] [amount] - Test proxies against specific site
+/judge - Show current judge URL
+"""
+    await message.answer(help_text, parse_mode=ParseMode.MARKDOWN)
+
+# ----------------------------------------------------------------------------
+# Scraping Commands
+# ----------------------------------------------------------------------------
+@router.message(Command("scrape"))
+async def cmd_scrape(message: types.Message):
+    if not scraper:
+        await message.answer("Scraper not initialized.")
+        return
+    msg = await message.answer("🔄 Scraping started...")
+    count = await scraper.scrape_all()
+    await msg.edit_text(f"✅ Scraping completed. Added/updated {count} unique proxies.")
+
+@router.message(Command("listsources"))
+async def cmd_listsources(message: types.Message):
+    sources = "\n".join(PROXY_SOURCES[:10]) + f"\n... and {len(PROXY_SOURCES)-10} more"
+    await message.answer(f"**Proxy Sources ({len(PROXY_SOURCES)}):**\n{sources}")
+
+@router.message(Command("addsource"))
+async def cmd_addsource(message: types.Message, state: FSMContext):
+    await message.answer("Send me the URL to add as a proxy source:")
+    await state.set_state(SourceStates.waiting_for_url)
+
+@router.message(SourceStates.waiting_for_url)
+async def process_addsource(message: types.Message, state: FSMContext):
+    url = message.text.strip()
+    if not url.startswith(("http://", "https://")):
+        await message.answer("Invalid URL. Must start with http:// or https://")
+        return
+    PROXY_SOURCES.append(url)
+    await message.answer(f"✅ Added source: {url}")
+    await state.clear()
+
+@router.message(Command("removesource"))
+async def cmd_removesource(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: /removesource <url>")
+        return
+    url = command.args.strip()
+    if url in PROXY_SOURCES:
+        PROXY_SOURCES.remove(url)
+        await message.answer(f"✅ Removed source: {url}")
     else:
-        pages = user_sessions.get(message.from_user.id, {}).get("pages", DEFAULT_PAGES)
-        await engine.load_dorks(content, pages)
-        if not engine.workers:
-            await engine.start(num_workers=50)
-        await message.reply(f"✅ Loaded {len(content)} dorks. Engine started with {pages} pages each.")
+        await message.answer("Source not found.")
 
-@router.message(Command("checkproxys"))
-@admin_only
-async def cmd_check(message: Message):
-    stats = await engine.pool.check_proxies()
-    await message.reply(f"🌐 Proxies: {stats['alive']} Alive / {stats['dead']} Dead (Total: {stats['total']})")
+# ----------------------------------------------------------------------------
+# Checking Commands
+# ----------------------------------------------------------------------------
+async def perform_check(proxies: List[Tuple[str, Optional[str]]], message: types.Message):
+    """Run checker on list of (proxy, protocol_hint) tuples with progress updates."""
+    if not checker:
+        await message.answer("Checker not initialized.")
+        return
 
-@router.message(Command("setspeed"))
-@admin_only
-async def cmd_speed(message: Message):
-    try:
-        rps = float(message.text.split()[1])
-        engine.set_speed(rps)
-        await message.reply(f"✅ Speed set to {rps} req/sec per proxy.")
-    except:
-        await message.reply("Usage: /setspeed <rps>")
+    total = len(proxies)
+    if total == 0:
+        await message.answer("No proxies to check.")
+        return
 
-@router.message(Command("pause"))
-@admin_only
-async def cmd_pause(message: Message):
-    engine.pause()
-    await message.reply("⏸ Engine paused.")
+    msg = await message.answer(f"⚡ Checking {total} proxies with concurrency {current_concurrency}...")
+    semaphore = Semaphore(current_concurrency)
+    alive_count = 0
+    start_time = time.monotonic()
 
-@router.message(Command("resume"))
-@admin_only
-async def cmd_resume(message: Message):
-    engine.resume()
-    await message.reply("▶️ Engine resumed.")
-
-@router.message(Command("status"))
-@admin_only
-async def cmd_status(message: Message):
-    msg = await message.reply("⏳ Gathering stats...")
-    for _ in range(15):  # Update for 30 seconds
-        elapsed = time.time() - engine.stats.start_time
-        rps = engine.stats.total_requests / elapsed if elapsed > 0 else 0
-        ups = engine.stats.total_urls / elapsed if elapsed > 0 else 0
-        qsize = engine.queue.qsize()
-        
-        text = (
-            f"📊 <b>Live Status</b>\n"
-            f"RPS: <b>{rps:.1f}</b> | UPS: <b>{ups:.1f}</b>\n"
-            f"Queue: <b>{qsize}</b>\n"
-            f"Total Reqs: {engine.stats.total_requests}\n"
-            f"Total URLs: {engine.stats.total_urls}\n"
-            f"Failed Reqs: {engine.stats.failed_requests}"
+    # Create tasks and gather
+    tasks = [checker.check_proxy(p, semaphore, hint) for p, hint in proxies]
+    # Process in chunks to update progress
+    chunk_size = 100
+    for i in range(0, len(tasks), chunk_size):
+        chunk = tasks[i:i+chunk_size]
+        results = await asyncio.gather(*chunk, return_exceptions=True)
+        alive_count += sum(1 for r in results if isinstance(r, dict) and r)
+        # Update progress
+        progress = min(i+chunk_size, total)
+        elapsed = time.monotonic() - start_time
+        rate = progress / elapsed if elapsed > 0 else 0
+        await msg.edit_text(
+            f"⚡ Checked {progress}/{total} | Alive: {alive_count} | {rate:.1f} p/s"
         )
-        
-        try:
-            await msg.edit_text(text)
-        except Exception:
-            pass 
-        await asyncio.sleep(2.0)
-        
-@router.message(Command("export"))
-@admin_only
-async def cmd_export(message: Message):
-    await message.reply("📦 Exporting URLs...")
-    
-    async with aiofiles.open("urls_export.txt", "w") as f:
-        async with db.db.execute("SELECT url FROM urls") as cursor:
-            while True:
-                rows = await cursor.fetchmany(10000)
-                if not rows:
-                    break
-                for row in rows:
-                    await f.write(row[0] + "\n")
-                    
-    with open("urls_export.txt", "rb") as f:
-        await message.reply_document(BufferedInputFile(f.read(), filename="urls_export.txt"))
-    os.remove("urls_export.txt")
 
-@router.message(Command("stop"))
-@admin_only
-async def cmd_stop(message: Message):
-    await message.reply("🛑 Stopping engine...")
-    await engine.stop()
-    await cmd_export(message)
+    elapsed = time.monotonic() - start_time
+    await msg.edit_text(
+        f"✅ Check completed. {alive_count}/{total} alive.\n"
+        f"Time: {elapsed:.1f}s | Rate: {total/elapsed:.1f} p/s"
+    )
+
+@router.message(Command("check"))
+async def cmd_check(message: types.Message, command: CommandObject):
+    args = command.args.split() if command.args else []
+    limit = None
+    protocol = None
+    country = None
+    anonymity = None
+    try:
+        if args:
+            limit = int(args[0])
+        if len(args) > 1:
+            protocol = args[1]
+        if len(args) > 2:
+            country = args[2]
+        if len(args) > 3:
+            anonymity = args[3]
+    except ValueError:
+        await message.answer("Invalid arguments. Usage: /check [amount] [protocol] [country] [anonymity]")
+        return
+
+    proxies_data = await db.get_proxies(status="unknown", protocol=protocol, country=country, anonymity=anonymity, limit=limit)
+    if not proxies_data:
+        await message.answer("No proxies found matching criteria.")
+        return
+    proxies = [(p[0], p[1]) for p in proxies_data]
+    await perform_check(proxies, message)
+
+@router.message(Command("checkall"))
+async def cmd_checkall(message: types.Message, command: CommandObject):
+    limit = None
+    if command.args:
+        try:
+            limit = int(command.args)
+        except ValueError:
+            await message.answer("Invalid number. Usage: /checkall [limit]")
+            return
+    proxies_data = await db.get_all_proxies_for_check(limit=limit)
+    await perform_check(proxies_data, message)
+
+@router.message(Command("test"))
+async def cmd_test(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: /test <proxy>")
+        return
+    proxy = command.args.strip()
+    if not checker:
+        await message.answer("Checker not initialized.")
+        return
+    msg = await message.answer(f"Testing {proxy}...")
+    sem = Semaphore(1)
+    result = await checker.check_proxy(proxy, sem, resolve_geo=True)
+    if result:
+        await msg.edit_text(
+            f"✅ Proxy alive: {result['proxy']}\n"
+            f"Protocol: {result['protocol']}\n"
+            f"Country: {result['country']}\n"
+            f"Anonymity: {result['anonymity']}\n"
+            f"Speed: {result['speed']} ms"
+        )
+    else:
+        await msg.edit_text(f"❌ Proxy dead: {proxy}")
+
+@router.message(Command("seturl"))
+async def cmd_seturl(message: types.Message, command: CommandObject):
+    global TEST_URL
+    if not command.args:
+        await message.answer(f"Current test URL: {TEST_URL}")
+        return
+    TEST_URL = command.args.strip()
+    await message.answer(f"✅ Test URL set to: {TEST_URL}")
+
+@router.message(Command("setthreads"))
+async def cmd_setthreads(message: types.Message, command: CommandObject):
+    global current_concurrency
+    if not command.args:
+        await message.answer(f"Current concurrency: {current_concurrency}")
+        return
+    try:
+        val = int(command.args)
+        if val < 1 or val > MAX_CONCURRENCY:
+            await message.answer(f"Value must be between 1 and {MAX_CONCURRENCY}")
+            return
+        current_concurrency = val
+        await message.answer(f"✅ Concurrency set to {current_concurrency}")
+    except ValueError:
+        await message.answer("Invalid number.")
+
+# ----------------------------------------------------------------------------
+# Stats & Filtering
+# ----------------------------------------------------------------------------
+@router.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    stats = await db.get_stats()
+    text = (
+        f"📊 **Proxy Statistics**\n"
+        f"Total in DB: {stats['total']}\n"
+        f"Alive: {stats['alive']}\n\n"
+        f"**By Protocol:**\n"
+    )
+    for proto, cnt in stats['by_protocol'].items():
+        text += f"{proto}: {cnt}\n"
+    text += "\n**Top Countries:**\n"
+    for country, cnt in list(stats['by_country'].items())[:10]:
+        text += f"{country}: {cnt}\n"
+    text += "\n**By Anonymity:**\n"
+    for anon, cnt in stats['by_anonymity'].items():
+        text += f"{anon}: {cnt}\n"
+    await message.answer(text)
+
+@router.message(Command("filter"))
+async def cmd_filter(message: types.Message, command: CommandObject):
+    args = command.args.split() if command.args else []
+    protocol = args[0] if len(args) > 0 else None
+    country = args[1] if len(args) > 1 else None
+    anonymity = args[2] if len(args) > 2 else None
+    proxies = await db.get_proxies(status="alive", protocol=protocol, country=country, anonymity=anonymity, limit=50)
+    if not proxies:
+        await message.answer("No alive proxies found.")
+        return
+    text = "**Alive Proxies:**\n"
+    for p in proxies:
+        text += f"{p[0]} | {p[1]} | {p[2]} | {p[3]} | {p[4]}ms\n"
+    await message.answer(text[:4000])
+
+@router.message(Command("top"))
+async def cmd_top(message: types.Message, command: CommandObject):
+    args = command.args.split() if command.args else []
+    limit = 10
+    protocol = None
+    country = None
+    try:
+        if args:
+            limit = int(args[0])
+        if len(args) > 1:
+            protocol = args[1]
+        if len(args) > 2:
+            country = args[2]
+    except ValueError:
+        pass
+    proxies = await db.get_proxies(status="alive", protocol=protocol, country=country, limit=limit)
+    if not proxies:
+        await message.answer("No proxies found.")
+        return
+    text = f"**Top {len(proxies)} Fastest Proxies:**\n"
+    for p in proxies:
+        text += f"{p[0]} | {p[1]} | {p[2]} | {p[3]} | {p[4]}ms\n"
+    await message.answer(text)
+
+@router.message(Command("countries"))
+async def cmd_countries(message: types.Message):
+    rows = await db.fetchall(
+        "SELECT country, COUNT(*) FROM proxies WHERE status='alive' AND country IS NOT NULL GROUP BY country ORDER BY COUNT(*) DESC"
+    )
+    text = "**Country Counts (alive):**\n"
+    for country, cnt in rows:
+        text += f"{country}: {cnt}\n"
+    await message.answer(text)
+
+# ----------------------------------------------------------------------------
+# Export
+# ----------------------------------------------------------------------------
+@router.message(Command("export"))
+async def cmd_export(message: types.Message, command: CommandObject):
+    args = command.args.split() if command.args else []
+    fmt = args[0] if args else "txt"
+    protocol = args[1] if len(args) > 1 else None
+    country = args[2] if len(args) > 2 else None
+    anonymity = args[3] if len(args) > 3 else None
+
+    proxies = await db.get_proxies(status="alive", protocol=protocol, country=country, anonymity=anonymity)
+    if not proxies:
+        await message.answer("No alive proxies to export.")
+        return
+
+    filename = f"export_{int(time.time())}.{fmt}"
+    if fmt == "txt":
+        content = "\n".join([p[0] for p in proxies])
+        async with aiofiles.open(filename, "w") as f:
+            await f.write(content)
+    elif fmt == "json":
+        data = [{"proxy": p[0], "protocol": p[1], "country": p[2], "anonymity": p[3], "speed": p[4]} for p in proxies]
+        async with aiofiles.open(filename, "wb") as f:
+            await f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2))
+    elif fmt == "csv":
+        content = "proxy,protocol,country,anonymity,speed\n"
+        content += "\n".join([f"{p[0]},{p[1]},{p[2]},{p[3]},{p[4]}" for p in proxies])
+        async with aiofiles.open(filename, "w") as f:
+            await f.write(content)
+    else:
+        await message.answer("Unsupported format. Use txt, json, or csv.")
+        return
+
+    await message.answer_document(FSInputFile(filename))
+    os.remove(filename)
+
+# ----------------------------------------------------------------------------
+# Maintenance
+# ----------------------------------------------------------------------------
+@router.message(Command("clear_dead"))
+async def cmd_clear_dead(message: types.Message):
+    await db.clear_dead()
+    await message.answer("✅ Dead proxies cleared.")
+
+@router.message(Command("clear_old"))
+async def cmd_clear_old(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: /clear_old <days>")
+        return
+    try:
+        days = int(command.args)
+        await db.clear_old(days)
+        await message.answer(f"✅ Cleared proxies older than {days} days.")
+    except ValueError:
+        await message.answer("Invalid number.")
+
+@router.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    backup_path = f"backup_{int(time.time())}.db"
+    import shutil
+    shutil.copy(DB_PATH, backup_path)
+    await message.answer_document(FSInputFile(backup_path))
+    os.remove(backup_path)
 
 @router.message(Command("reset"))
-@admin_only
-async def cmd_reset(message: Message):
-    global engine
-    await engine.stop()
-    engine = DorkEngine(db)
-    await db.db.execute("DELETE FROM urls")
-    await db.db.commit()
-    await message.reply("🔄 System reset. DB cleared.")
+async def cmd_reset(message: types.Message):
+    await db.execute("DELETE FROM proxies")
+    await db.vacuum()
+    await message.answer("✅ Database reset.")
+
+# ----------------------------------------------------------------------------
+# Automation
+# ----------------------------------------------------------------------------
+async def auto_scrape_loop():
+    while True:
+        try:
+            if scraper:
+                await scraper.scrape_all()
+        except Exception as e:
+            logger.error(f"Auto scrape error: {e}")
+        await asyncio.sleep(AUTO_SCRAPE_INTERVAL)
+
+async def auto_check_loop():
+    while True:
+        try:
+            proxies = await db.get_all_proxies_for_check(limit=AUTO_CHECK_BATCH_SIZE)
+            if proxies:
+                semaphore = Semaphore(current_concurrency)
+                tasks = [checker.check_proxy(p, semaphore, hint) for p, hint in proxies]
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Auto check error: {e}")
+        await asyncio.sleep(AUTO_CHECK_INTERVAL)
+
+async def geoip_resolver_loop():
+    """Background task: periodically batch-resolves country codes for alive
+    proxies that don't have one yet, via ip-api's /batch endpoint."""
+    while True:
+        try:
+            proxies = await db.get_proxies_missing_country(limit=GEOIP_BATCH_SIZE * 5)
+            if proxies:
+                ip_to_proxies: Dict[str, List[str]] = defaultdict(list)
+                for proxy in proxies:
+                    ip_to_proxies[proxy.split(":")[0]].append(proxy)
+                resolved = await checker.resolve_geoip_batch(list(ip_to_proxies.keys()))
+                records = [
+                    (cc, proxy)
+                    for ip, cc in resolved.items()
+                    for proxy in ip_to_proxies.get(ip, [])
+                ]
+                if records:
+                    await db.batch_update_country(records)
+                    logger.debug(f"GeoIP resolved {len(records)} proxies")
+        except Exception as e:
+            logger.error(f"GeoIP resolver error: {e}")
+        await asyncio.sleep(GEOIP_RESOLVE_INTERVAL)
+
+@router.message(Command("auto_scrape"))
+async def cmd_auto_scrape(message: types.Message, command: CommandObject):
+    global AUTO_SCRAPE_INTERVAL
+    if command.args:
+        try:
+            hours = float(command.args)
+            AUTO_SCRAPE_INTERVAL = int(hours * 3600)
+        except ValueError:
+            await message.answer("Invalid hours.")
+            return
+    if "scrape" in auto_tasks:
+        auto_tasks["scrape"].cancel()
+    task = asyncio.create_task(auto_scrape_loop())
+    auto_tasks["scrape"] = task
+    await message.answer(f"✅ Auto scrape enabled every {AUTO_SCRAPE_INTERVAL//3600} hours.")
+
+@router.message(Command("auto_check"))
+async def cmd_auto_check(message: types.Message, command: CommandObject):
+    global AUTO_CHECK_INTERVAL
+    if command.args:
+        try:
+            minutes = float(command.args)
+            AUTO_CHECK_INTERVAL = int(minutes * 60)
+        except ValueError:
+            await message.answer("Invalid minutes.")
+            return
+    else:
+        AUTO_CHECK_INTERVAL = 60
+    if "check" in auto_tasks:
+        auto_tasks["check"].cancel()
+    task = asyncio.create_task(auto_check_loop())
+    auto_tasks["check"] = task
+    await message.answer(f"✅ Auto check enabled every {AUTO_CHECK_INTERVAL//60} minutes.")
+
+@router.message(Command("stop_auto"))
+async def cmd_stop_auto(message: types.Message):
+    for name, task in auto_tasks.items():
+        task.cancel()
+    auto_tasks.clear()
+    await message.answer("✅ All auto tasks stopped.")
+
+@router.message(Command("status"))
+async def cmd_status(message: types.Message):
+    status_text = f"**System Status**\n"
+    status_text += f"Concurrency: {current_concurrency}\n"
+    status_text += f"Test URL: {TEST_URL}\n"
+    status_text += f"Auto scrape: {'enabled' if 'scrape' in auto_tasks else 'disabled'}\n"
+    status_text += f"Auto check: {'enabled' if 'check' in auto_tasks else 'disabled'}\n"
+    stats = await db.get_stats()
+    status_text += f"Total proxies: {stats['total']}, Alive: {stats['alive']}\n"
+    await message.answer(status_text)
+
+# ----------------------------------------------------------------------------
+# Advanced
+# ----------------------------------------------------------------------------
+@router.message(Command("scan"))
+async def cmd_scan(message: types.Message, command: CommandObject):
+    args = command.args.split() if command.args else []
+    if len(args) < 1:
+        await message.answer("Usage: /scan <url> [protocol] [amount]")
+        return
+    url = args[0]
+    protocol = args[1] if len(args) > 1 else None
+    limit = int(args[2]) if len(args) > 2 else 10
+
+    proxies_data = await db.get_proxies(status="alive", protocol=protocol, limit=limit)
+    if not proxies_data:
+        await message.answer("No proxies found.")
+        return
+
+    msg = await message.answer(f"Scanning {url} with {len(proxies_data)} proxies...")
+    sem = Semaphore(current_concurrency)
+
+    async def test_one(proxy_str):
+        try:
+            proxy_url = f"http://{proxy_str}"
+            async with checker.session.get(url, proxy=proxy_url, timeout=ClientTimeout(total=5)) as resp:
+                return proxy_str, resp.status
+        except Exception:
+            return proxy_str, None
+
+    tasks = [test_one(p[0]) for p in proxies_data]
+    results = await asyncio.gather(*tasks)
+
+    working = [r for r in results if r[1] == 200]
+    text = f"**Scan Results for {url}**\n"
+    for proxy, status in working:
+        text += f"{proxy} -> {status}\n"
+    text += f"\nWorking: {len(working)}/{len(proxies_data)}"
+    await msg.edit_text(text)
+
+@router.message(Command("judge"))
+async def cmd_judge(message: types.Message):
+    await message.answer(f"Current judge URL: {TEST_URL}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+async def on_startup():
+    global checker, scraper, batch_writer_task, geoip_task
+    await db.connect()
+    checker = ProxyChecker()
+    await checker.start()
+    scraper = ProxyScraper(checker.session)
+    batch_writer_task = asyncio.create_task(batch_writer())
+    geoip_task = asyncio.create_task(geoip_resolver_loop())
+    logger.info("Bot started, components initialized.")
+
+async def on_shutdown():
+    # Gracefully shut down batch writer to flush remaining records
+    if batch_writer_task:
+        batch_writer_task.cancel()
+        try:
+            await batch_writer_task
+        except asyncio.CancelledError:
+            pass
+
+    if geoip_task:
+        geoip_task.cancel()
+    for task in auto_tasks.values():
+        task.cancel()
+    auto_tasks.clear()
+    if checker:
+        await checker.close()
+    await db.close()
+    logger.info("Bot shutdown.")
 
 async def main():
-    logger.info("Initializing Database...")
-    await db.init()
-    logger.info("Starting Bot...")
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    # IMPORTANT: Delete any active webhook to allow polling
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    await on_startup()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await on_shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
